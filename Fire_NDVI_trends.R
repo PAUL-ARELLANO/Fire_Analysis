@@ -2,7 +2,7 @@
 # R SCRIPT FOR ANALYZING NDVI TRENDS IN BURNED VS. UNBURNED AREAS
 # -----------------------------------------------------------------------------
 #
-# OBJECTIVE:  
+# OBJECTIVE:
 # This script analyzes the correlation between vegetation trends (from an NDVI
 # trend raster) and the occurrence of forest fires (from shapefiles). It
 # extracts trend values within fire perimeters, calculates summary statistics,
@@ -14,9 +14,10 @@
 # 2. Fire_2023_ARIZONA.shp: A shapefile of fire perimeters for 2023.
 # 3. Fire_2024_ARIZONA.shp: A shapefile of fire perimeters for 2024.
 #
-# Author: Paul Arellano, PhD
-# Date:   July, 04 2025
-#
+# Author: Gemini Code Assist
+# Date:   October 26, 2023
+# Version: 2.0. Analysis year by year 2023 and 2024
+# Restuls: Scatterplots for burned and unburned areas for 2023 and 2024 are very similar
 # -----------------------------------------------------------------------------
 
 # --- 1. SETUP: Install and Load Libraries ---
@@ -65,64 +66,73 @@ fires_2023 <- st_read(path_fire_2023)
 fires_2024 <- st_read(path_fire_2024)
 
 # Add a 'year' column to each dataset before merging
-fires_2023$year <- 2023
-fires_2024$year <- 2024
-
-# Combine the two fire datasets into a single feature collection
-all_fires <- rbind(fires_2023, fires_2024)
+fires_2023$fire_year <- 2023
+fires_2024$fire_year <- 2024
 
 # --- CRS Check and Reprojection ---
 # Ensure the fire polygons have the same Coordinate Reference System (CRS) as the raster
 cat("🔄 Checking and aligning Coordinate Reference Systems (CRS)...\n")
-if (st_crs(all_fires) != st_crs(ndvi_trend_raster)) {
-  cat("CRS mismatch detected. Reprojecting fire polygons...\n")
-  all_fires <- st_transform(all_fires, st_crs(ndvi_trend_raster))
+if (st_crs(fires_2023) != st_crs(ndvi_trend_raster)) {
+  cat("CRS mismatch detected. Reprojecting 2023 fire polygons...\n")
+  fires_2023 <- st_transform(fires_2023, st_crs(ndvi_trend_raster))
+}
+if (st_crs(fires_2024) != st_crs(ndvi_trend_raster)) {
+  cat("CRS mismatch detected. Reprojecting 2024 fire polygons...\n")
+  fires_2024 <- st_transform(fires_2024, st_crs(ndvi_trend_raster))
 }
 
 cat("✅ Data loaded and prepared.\n")
 print(ndvi_trend_raster)
-print(all_fires)
+
 
 
 # --- 4. ANALYSIS: Extract NDVI Trends and Calculate Statistics ---
 
-# --- 4.1. Extract Trends within Burned Areas ---
-cat("🔄 Extracting NDVI trend values from within fire perimeters...\n")
-# This function returns a list, where each element is the vector of pixel values for a polygon
-burned_pixel_values <- terra::extract(ndvi_trend_raster, vect(all_fires))
-
-# Rename the second column (the actual trend values) to "ndvi_trend". The first is "ID".
-names(burned_pixel_values)[2] <- "ndvi_trend"
-
-
-# Combine the extracted values with the fire polygon attributes
-# The ID column from the extraction links back to the row number of `all_fires`
-burned_data <- burned_pixel_values %>%
-  as_tibble() %>%
-  # Add fire attributes (like year, name, etc.) using the ID
-  mutate(fire_id = ID) %>%
-  left_join(st_drop_geometry(all_fires) %>% mutate(fire_id = row_number()))
-
-# --- 4.2. Extract Trends from Unburned Areas (for comparison) ---
+# --- 4.1. Extract Trends from Unburned Areas (for comparison) ---
+# This is done first to create a consistent baseline of "unburned" pixels
+# by masking out ALL fires from both years.
 cat("🔄 Sampling NDVI trend values from unburned areas for comparison...\n")
 # Create a mask of the burned areas
-burned_mask <- terra::rasterize(vect(all_fires), ndvi_trend_raster, field = 1)
+all_fires_vect <- vect(rbind(fires_2023, fires_2024))
+burned_mask <- terra::rasterize(all_fires_vect, ndvi_trend_raster, field = 1)
 unburned_raster <- terra::mask(ndvi_trend_raster, burned_mask, inverse = TRUE)
 
 # Take a random sample of pixels from the unburned areas
 # We sample a large number to get a representative distribution
 unburned_pixel_values <- spatSample(unburned_raster, size = 50000, na.rm = TRUE, as.df = TRUE)
 names(unburned_pixel_values) <- "ndvi_trend"
-
-# --- 4.3. Combine Data for Plotting and Summary ---
-burned_data$type <- "Burned"
 unburned_pixel_values$type <- "Unburned"
 
+# --- 4.2. Define a function to process burned areas for a given year ---
+process_burned_year <- function(fire_sf, year) {
+  cat(paste("🔄 Extracting NDVI trend values from within", year, "fire perimeters...\n"))
+  
+  # Extract pixel values
+  burned_pixels <- terra::extract(ndvi_trend_raster, vect(fire_sf))
+  names(burned_pixels)[2] <- "ndvi_trend" # Rename the value column
+  
+  # Format into a clean data frame
+  burned_data <- burned_pixels %>%
+    as_tibble() %>%
+    select(ndvi_trend) %>%
+    mutate(type = "Burned", year = year)
+  
+  return(burned_data)
+}
+
+# --- 4.3. Process each year and combine data ---
+burned_data_2023 <- process_burned_year(fires_2023, 2023)
+burned_data_2024 <- process_burned_year(fires_2024, 2024)
+
+# Create a version of the unburned data for each year to facilitate comparison
+unburned_for_comparison <- bind_rows(
+  unburned_pixel_values %>% mutate(year = 2023),
+  unburned_pixel_values %>% mutate(year = 2024)
+)
+
 # Combine all pixel values into one dataframe for easy plotting
-combined_df <- bind_rows(
-  burned_data %>% select(ndvi_trend, type),
-  unburned_pixel_values %>% select(ndvi_trend, type)
-) %>% drop_na()
+combined_df <- bind_rows(burned_data_2023, burned_data_2024, unburned_for_comparison) %>% 
+  drop_na()
 
 cat("✅ Trend extraction complete.\n")
 
@@ -135,7 +145,7 @@ cat("🔄 Calculating summary statistics...\n")
 trend_threshold <- 0.001
 
 summary_stats <- combined_df %>%
-  group_by(type) %>%
+  group_by(year, type) %>%
   summarise(
     pixel_count = n(),
     mean_trend = mean(ndvi_trend, na.rm = TRUE),
@@ -157,7 +167,7 @@ cat("--- Summary Statistics ---\n")
 print(as.data.frame(summary_stats))
 
 # Save summary statistics to a CSV file
-output_csv_path <- file.path(output_dir, "ndvi_trend_fire_summary_stats.csv")
+output_csv_path <- file.path(output_dir, "ndvi_trend_fire_summary_stats_by_year.csv")
 write.csv(summary_stats, output_csv_path, row.names = FALSE)
 cat(paste0("✅ Summary statistics saved to: ", output_csv_path, "\n"))
 
@@ -176,28 +186,30 @@ density_plot <- ggplot(combined_df, aes(x = ndvi_trend, fill = type)) +
     x = "NDVI Trend (Slope)",
     y = "Density",
     fill = "Area Type"
-  ) +
+  ) + 
+  facet_wrap(~ year) + # Create separate plots for each year
   theme_minimal()
 
 print(density_plot)
-ggsave(file.path(output_dir, "ndvi_trend_density_plot.png"), density_plot, width = 8, height = 6)
+ggsave(file.path(output_dir, "ndvi_trend_density_plot_by_year.png"), density_plot, width = 10, height = 6)
 
 # --- 6.2. Box Plot ---
 # Provides a clear comparison of the central tendency and spread
 box_plot <- ggplot(combined_df, aes(x = type, y = ndvi_trend, fill = type)) +
-  geom_boxplot(alpha = 0.8) +
+  geom_boxplot(alpha = 0.8, outlier.shape = NA) + # outlier.shape = NA hides the outliers
   geom_hline(yintercept = 0, linetype = "dashed", color = "black") +
   scale_fill_manual(values = c("Burned" = "#d95f02", "Unburned" = "#1b9e77")) +
   labs(
     title = "Comparison of NDVI Trends in Burned vs. Unburned Areas",
     x = "Area Type",
     y = "NDVI Trend (Slope)"
-  ) +
+  ) + 
+  facet_wrap(~ year) + # Create separate plots for each year
   theme_minimal() +
   theme(legend.position = "none")
 
 print(box_plot)
-ggsave(file.path(output_dir, "ndvi_trend_boxplot.png"), box_plot, width = 6, height = 6)
+ggsave(file.path(output_dir, "ndvi_trend_boxplot_by_year.png"), box_plot, width = 8, height = 6)
 
 cat(paste0("✅ Visualizations saved to: ", output_dir, "\n"))
 
