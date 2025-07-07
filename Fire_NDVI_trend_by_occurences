@@ -1,0 +1,313 @@
+# -----------------------------------------------------------------------------
+# R SCRIPT FOR ANALYZING NDVI TRENDS IN BURNED VS. UNBURNED AREAS
+# -----------------------------------------------------------------------------
+#
+# OBJECTIVE:
+# This script analyzes the correlation between vegetation trends (from an NDVI
+# trend raster) and the occurrence of forest fires (from shapefiles). It
+# extracts trend values within fire perimeters, calculates summary statistics,
+# compares them to unburned areas, and visualizes the results.
+# 
+# The analysis is conducted on a polygone-by-polygon (occurences) basis, allowing for
+# detailed insights into how each fire event relates to vegetation trends.
+# Control samples are taken from unburned areas within a specified distance from each fire perimeter,
+# 
+# THe output includes:
+# 1. Summary statistics for each fire polygon, comparing burned vs. unburned areas.
+# 2. Visualizations showing the NDVI trend differences between burned and unburned areas.
+# 3. Suggestions for further analysis based on the results.
+#
+# REQUIRED FILES:
+# 1. ARIZONA_TREND_full_23_24.tif: A raster where pixel values represent the
+#    NDVI trend (e.g., slope of change). Negative values indicate decline.
+# 2. Fire_2023_ARIZONA.shp: A shapefile of fire perimeters for 2023.
+# 3. Fire_2024_ARIZONA.shp: A shapefile of fire perimeters for 2024.
+# 4. NDVI_2023_full.tif: A raster of NDVI values for 2023.
+# 5. NDVI_2024_full.tif: A raster of NDVI values for 2024.
+#
+# Author: Paul Arellano, PhD
+# Date:   July 05, 2025
+#
+# Filename: Fire_NDVI_trends_1.R
+# Folder: C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/Fire_analysis
+# -----------------------------------------------------------------------------
+
+# --- 1. SETUP: Install and Load Libraries ---
+
+# Install packages if they are not already installed
+# (run these lines once if needed)
+# install.packages("terra")
+# install.packages("sf")
+# install.packages("dplyr")
+# install.packages("ggplot2")
+# install.packages("tidyr")
+
+# Load the libraries
+library(terra)
+library(sf)
+library(dplyr)
+library(ggplot2)
+library(tidyr)
+
+cat("✅ Libraries loaded successfully.\n")
+
+
+# --- 2. CONFIGURATION: Define File Paths ---
+
+# !!! IMPORTANT: UPDATE THESE PATHS TO MATCH YOUR FILE LOCATIONS !!!
+path_ndvi_trend <- "C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/NDVI_TREND/ARIZONA_TREND_full_23_24.tif"
+path_fire_2023  <- "C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/DATA/FIRES/Fires_2023_ARIZONA.shp"
+path_fire_2024  <- "C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/DATA/FIRES/Fires_2024_ARIZONA.shp"
+output_dir      <- "C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/Fire_analysis/OUTPUT" # Directory to save results
+path_ndvi_2023 <- "C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/NDVI_TREND/NDVI_2023_full.tif" # <-- ADD PATH
+path_ndvi_2024 <- "C:/Users/pa589/NAU/TREE_STRESS/TreeStress_detection/MODELS/GEE_change_detection/ANOMALIES/Priority_Analysis/NDVI_TREND/NDVI_2024_full.tif" # <-- ADD PATH
+
+# --- Analysis Parameters ---
+buffer_distance_meters <- 1000 # How far from fire perimeters to look for unburned samples
+unburned_sample_size <- 25000 # Number of unburned pixels to sample for each year's comparison
+healthy_ndvi_percentile <- 0.75 # Sample from pixels with NDVI in the top (1 - percentile)
+# e.g., 0.75 means sampling from the top 25% of NDVI values.
+
+# Create output directory if it doesn't exist
+if (!dir.exists(output_dir)) {
+  dir.create(output_dir, recursive = TRUE)
+}
+
+
+# --- 3. DATA LOADING AND PREPARATION ---
+
+# Load the NDVI trend raster
+cat("🔄 Loading NDVI trend raster...\n")
+ndvi_trend_raster <- rast(path_ndvi_trend)
+
+# Load the fire perimeter shapefiles
+cat("🔄 Loading fire perimeter shapefiles...\n")
+fires_2023 <- st_read(path_fire_2023)
+fires_2024 <- st_read(path_fire_2024)
+
+cat("🔄 Loading annual NDVI rasters for targeted sampling...\n")
+ndvi_2023_raster <- rast(path_ndvi_2023)
+ndvi_2024_raster <- rast(path_ndvi_2024)
+
+# Add a 'year' column to each dataset before merging
+fires_2023$fire_year <- 2023
+fires_2024$fire_year <- 2024
+
+# --- Add a unique polygon ID ---
+# Tries to find a common name column, otherwise creates a generic ID.
+# !!! You may need to change "IncidentNa" to the actual name of the ID column in your shapefile.
+add_unique_id <- function(sf_object, year_prefix) {
+  if ("IncidentNa" %in% names(sf_object)) {
+    sf_object$polygon_id <- as.character(sf_object$IncidentNa)
+  } else if ("FIRE_NAME" %in% names(sf_object)) {
+    sf_object$polygon_id <- as.character(sf_object$FIRE_NAME)
+  } else {
+    sf_object$polygon_id <- paste0(year_prefix, "_", 1:nrow(sf_object))
+  }
+  return(sf_object)
+}
+fires_2023 <- add_unique_id(fires_2023, "fire2023")
+fires_2024 <- add_unique_id(fires_2024, "fire2024")
+
+# --- CRS Check and Reprojection ---
+# Ensure the fire polygons have the same Coordinate Reference System (CRS) as the raster
+cat("🔄 Checking and aligning Coordinate Reference Systems (CRS)...\n")
+if (st_crs(fires_2023) != st_crs(ndvi_trend_raster)) {
+  cat("CRS mismatch detected. Reprojecting 2023 fire polygons...\n")
+  fires_2023 <- st_transform(fires_2023, st_crs(ndvi_trend_raster))
+}
+if (st_crs(fires_2024) != st_crs(ndvi_trend_raster)) {
+  cat("CRS mismatch detected. Reprojecting 2024 fire polygons...\n")
+  fires_2024 <- st_transform(fires_2024, st_crs(ndvi_trend_raster))
+}
+
+cat("✅ Data loaded and prepared.\n")
+print(ndvi_trend_raster)
+
+
+# --- 4. ANALYSIS: Extract NDVI Trends and Calculate Statistics ---
+
+# --- 4.1. Define a function for TARGETED sampling of healthy, nearby unburned pixels ---
+sample_healthy_unburned <- function(fires_of_interest, all_fires_sf, health_raster, trend_raster, buffer_dist, sample_size, percentile) {
+  
+  cat(paste("  -> Creating", buffer_dist, "m buffer around target fires...\n"))
+  buffer_zone <- terra::buffer(vect(fires_of_interest), width = buffer_dist)
+  
+  cat("  -> Defining unburned areas within the buffer...\n")
+  # The potential sampling zone is the buffer area where no fires occurred.
+  # This is achieved by "erasing" the fire polygons from the buffer polygons.
+  potential_sampling_zone <- terra::erase(buffer_zone, vect(all_fires_sf))
+  
+  if (terra::is.empty(potential_sampling_zone)) {
+    warning(paste("No unburned pixels found within the", buffer_dist, "m buffer. Skipping unburned sampling for this fire."), call. = FALSE)
+    return(tibble(ndvi_trend = numeric(0)))
+  }
+  
+  cat("  -> Extracting NDVI and Trend values from potential unburned areas...\n")
+  # Stack rasters for efficient, simultaneous extraction
+  stacked_rasters <- c(health_raster, trend_raster)
+  names(stacked_rasters) <- c("health_ndvi", "ndvi_trend")
+  
+  # Extract all pixel values from the valid sampling zone
+  extracted_values <- terra::extract(stacked_rasters, potential_sampling_zone, df = TRUE, na.rm = TRUE) %>%
+    drop_na()
+  
+  if (nrow(extracted_values) == 0) {
+    warning("No valid pixels found after extraction in the unburned buffer zone.", call. = FALSE)
+    return(tibble(ndvi_trend = numeric(0)))
+  }
+  
+  cat(paste0("  -> Filtering for healthiest pixels (top ", (1 - percentile) * 100, "% NDVI)...\n"))
+  # Calculate the NDVI value at the specified percentile
+  ndvi_threshold <- quantile(extracted_values$health_ndvi, percentile, na.rm = TRUE)
+  
+  # Filter to keep only the pixels with high NDVI
+  healthy_pixels <- extracted_values %>% filter(health_ndvi >= ndvi_threshold)
+  
+  cat(paste0("    -> Taking final random sample of ", min(sample_size, nrow(healthy_pixels)), " pixels...\n"))
+  final_sample_size <- min(sample_size, nrow(healthy_pixels))
+  
+  # Take the final random sample from this "healthy" pool
+  final_sample <- healthy_pixels %>% sample_n(final_sample_size)
+  
+  return(final_sample %>% select(ndvi_trend))
+}
+
+# --- 4.2. Define a function to process BURNED areas for a given year ---
+process_burned_polygon <- function(fire_sf, year) {
+  cat(paste("🔄 Extracting NDVI trend values from within", year, "fire perimeters...\n"))
+  
+  # Extract pixel values
+  burned_pixels <- terra::extract(ndvi_trend_raster, vect(fire_sf))
+  names(burned_pixels)[2] <- "ndvi_trend" # Rename the value column
+  
+  # Format into a clean data frame
+  burned_data <- burned_pixels %>%
+    as_tibble() %>%
+    select(ndvi_trend) %>%
+    mutate(type = "Burned", year = year)
+  
+  return(burned_data)
+}
+
+# --- 4.3. Loop through each fire polygon to perform analysis ---
+
+all_fires_sf <- rbind(fires_2023, fires_2024) # Used to define unburned areas
+results_list <- list() # To store the results of each loop
+
+process_fire_year <- function(fires_sf, health_raster, year_label) {
+  for (i in 1:nrow(fires_sf)) {
+    single_fire_sf <- fires_sf[i, ]
+    polygon_id <- single_fire_sf$polygon_id
+    cat(paste0("\n--- Processing ", year_label, " Fire: ", polygon_id, " (", i, " of ", nrow(fires_sf), ") ---\n"))
+    
+    # 1. Process burned area
+    cat("  -> Analyzing burned area...\n")
+    burned_df <- process_burned_polygon(single_fire_sf, year_label)
+    
+    # 2. Process corresponding unburned control area
+    cat("  -> Sampling unburned control area...\n")
+    unburned_df <- sample_healthy_unburned(single_fire_sf, all_fires_sf, health_raster, ndvi_trend_raster, buffer_distance_meters, unburned_sample_size, healthy_ndvi_percentile) %>%
+      mutate(type = "Unburned", year = year_label)
+    
+    # 3. Combine and add to results list
+    if (nrow(burned_df) > 0 && nrow(unburned_df) > 0) {
+      results_list[[length(results_list) + 1]] <- bind_rows(burned_df, unburned_df) %>%
+        mutate(polygon_id = polygon_id)
+    }
+  }
+  return(results_list)
+}
+
+results_list <- process_fire_year(fires_2023, ndvi_2023_raster, 2023)
+results_list <- process_fire_year(fires_2024, ndvi_2024_raster, 2024)
+
+# Combine all pixel values into one dataframe for easy plotting
+combined_df <- bind_rows(results_list) %>%
+  drop_na()
+
+cat("✅ Trend extraction complete.\n")
+
+
+# --- 5. STATISTICAL SUMMARY ---
+cat("🔄 Calculating summary statistics...\n")
+
+# Define a threshold for what is considered a "significant" trend
+# (adjust if your trend values are on a different scale)
+trend_threshold <- 0.001
+
+summary_stats <- combined_df %>%
+  group_by(polygon_id, year, type) %>%
+  summarise(
+    pixel_count = n(),
+    mean_trend = mean(ndvi_trend, na.rm = TRUE),
+    median_trend = median(ndvi_trend, na.rm = TRUE),
+    sd_trend = sd(ndvi_trend, na.rm = TRUE),
+    min_trend = min(ndvi_trend, na.rm = TRUE),
+    max_trend = max(ndvi_trend, na.rm = TRUE),
+    neg_trend_pixels = sum(ndvi_trend < -trend_threshold, na.rm = TRUE),
+    pos_trend_pixels = sum(ndvi_trend > trend_threshold, na.rm = TRUE),
+    stable_pixels = sum(abs(ndvi_trend) <= trend_threshold, na.rm = TRUE)
+  ) %>%
+  mutate(
+    percent_neg_trend = (neg_trend_pixels / pixel_count) * 100,
+    percent_pos_trend = (pos_trend_pixels / pixel_count) * 100, 
+    percent_stable = (stable_pixels / pixel_count) * 100
+  )
+
+cat("--- Summary Statistics ---\n")
+print(as.data.frame(summary_stats))
+
+# Save summary statistics to a CSV file
+output_csv_path <- file.path(output_dir, "ndvi_trend_fire_summary_stats_per_polygon.csv")
+write.csv(summary_stats, output_csv_path, row.names = FALSE)
+cat(paste0("✅ Summary statistics saved to: ", output_csv_path, "\n"))
+
+
+# --- 6. VISUALIZATION ---
+cat("🔄 Generating per-polygon visualizations...\n")
+
+# --- 6.1. Prepare data for plotting ---
+# We want to compare the mean trend of the burned area vs. its unburned control
+plot_data <- summary_stats %>%
+  select(polygon_id, year, type, mean_trend) %>%
+  tidyr::pivot_wider(names_from = type, values_from = mean_trend) %>%
+  drop_na() # Remove any polygons where burned or unburned stats failed
+
+# --- 6.2. Dumbbell Plot ---
+# This plot is excellent for showing the change between two points (unburned vs burned) for each item (fire).
+dumbbell_plot <- ggplot(plot_data) +
+  # Create the "dumbbell" line from unburned to burned
+  geom_segment(aes(x = Unburned, xend = Burned, y = reorder(polygon_id, Burned), yend = polygon_id),
+               alpha = 0.7) +
+  # Add points for the unburned and burned values
+  geom_point(aes(x = Unburned, y = polygon_id), color = "#1b9e77", size = 3, alpha = 0.8) +
+  geom_point(aes(x = Burned, y = polygon_id), color = "#d95f02", size = 3, alpha = 0.8) +
+  # Add a vertical line at zero for reference
+  geom_vline(xintercept = 0, linetype = "dashed", color = "black") +
+  # Facet by year to create separate plots for 2023 and 2024
+  facet_wrap(~ year, scales = "free_y") +
+  labs(
+    title = "Comparison of NDVI Trend in Burned vs. Unburned Control Areas",
+    subtitle = "Each line represents a single fire polygon. Green = Unburned Control, Orange = Burned Area.",
+    x = "Mean NDVI Trend (Slope)",
+    y = "Fire Polygon ID"
+  ) +
+  theme_minimal() +
+  theme(axis.text.y = element_text(size = 7)) # Adjust text size if polygon names are long
+
+print(dumbbell_plot)
+ggsave(file.path(output_dir, "ndvi_trend_dumbbell_plot_per_polygon.png"), dumbbell_plot, width = 12, height = 10, dpi = 300)
+
+cat(paste0("✅ Visualizations saved to: ", output_dir, "\n"))
+
+
+# --- 7. SUGGESTIONS FOR FURTHER ANALYSIS ---
+cat("--- Suggestions for Further Analysis ---\n")
+cat("1.  Burn Severity Correlation: If you have burn severity data (e.g., from MTBS or calculated dNBR), correlate the mean/median NDVI trend within each fire perimeter with the severity class. This can validate if a stronger negative NDVI trend corresponds to higher burn severity.\n\n")
+cat("2.  Pre-Fire vs. Post-Fire Analysis: The current analysis likely shows the *impact* of the fire. To test if pre-existing vegetation stress made areas more susceptible to burning, you would need to calculate an NDVI trend using data *only from before* the 2023-2024 fire season and see if those trends differ inside vs. outside the fire perimeters.\n\n")
+cat("3.  Topographic Influence: Incorporate a Digital Elevation Model (DEM). Analyze if post-fire NDVI trends are correlated with elevation, slope, or aspect. For example, do south-facing slopes (more sun exposure) show slower recovery (less positive trend) after a fire?\n\n")
+cat("4.  Land Cover Analysis: Use a land cover map (like NLCD) to stratify your analysis. Do forests show a different trend response to fire compared to grasslands or shrublands?\n\n")
+cat("5.  Time-Series Breakpoint Analysis: Instead of a simple linear trend, use methods like BFAST or LandTrendr on the full NDVI time-series for each fire polygon. This can pinpoint the exact date of the disturbance (the fire) and quantify the magnitude of the drop and the subsequent recovery trajectory.\n\n")
+
+cat("--- Script Finished ---\n")
